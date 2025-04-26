@@ -797,6 +797,7 @@ class Git(metaclass=_GitMeta):
             finally:
                 if anchorpoint:
                     anchorpoint.finish_git_command(self.git_command_id)
+                    self.git_command_id = -1
 
         def __del__(self) -> None:
             self._terminate()
@@ -828,6 +829,10 @@ class Git(metaclass=_GitMeta):
             else:  # Assume the underlying proc was killed earlier or never existed.
                 status = self.status
                 p_stderr = None
+
+            if anchorpoint:
+                anchorpoint.finish_git_command(self.git_command_id)
+                self.git_command_id = -1
 
             def read_all_from_possibly_closed_stream(stream: Union[IO[bytes], None]) -> bytes:
                 if stream:
@@ -1232,240 +1237,223 @@ class Git(metaclass=_GitMeta):
                     plain_git_command = arg
                     command_found = True
 
-        def _execute():
-            nonlocal env, shell, max_chunk_size
-            # Remove password for the command if present.
-            redacted_command = remove_password_if_present(command)
-            if self.GIT_PYTHON_TRACE and (
-                self.GIT_PYTHON_TRACE != "full" or as_process
-            ):
-                _logger.info(" ".join(redacted_command))
+        # Remove password for the command if present.
+        redacted_command = remove_password_if_present(command)
+        if self.GIT_PYTHON_TRACE and (self.GIT_PYTHON_TRACE != "full" or as_process):
+            _logger.info(" ".join(redacted_command))
 
-            # Allow the user to have the command executed in their working dir.
-            try:
-                cwd = self._working_dir or os.getcwd()  # type: Union[None, str]
-                if not os.access(str(cwd), os.X_OK):
-                    cwd = None
-            except FileNotFoundError:
+        # Allow the user to have the command executed in their working dir.
+        try:
+            cwd = self._working_dir or os.getcwd()  # type: Union[None, str]
+            if not os.access(str(cwd), os.X_OK):
                 cwd = None
+        except FileNotFoundError:
+            cwd = None
 
-            # Start the process.
-            inline_env = env
-            env = os.environ.copy()
-            # Attempt to force all output to plain ASCII English, which is what some parsing
-            # code may expect.
-            # According to https://askubuntu.com/a/311796, we are setting LANGUAGE as well
-            # just to be sure.
-            env["LANGUAGE"] = "C"
-            env["LC_ALL"] = "C"
-            env.update(self._environment)
-            if inline_env is not None:
-                env.update(inline_env)
+        # Start the process.
+        inline_env = env
+        env = os.environ.copy()
+        # Attempt to force all output to plain ASCII English, which is what some parsing
+        # code may expect.
+        # According to https://askubuntu.com/a/311796, we are setting LANGUAGE as well
+        # just to be sure.
+        env["LANGUAGE"] = "C"
+        env["LC_ALL"] = "C"
+        env.update(self._environment)
+        if inline_env is not None:
+            env.update(inline_env)
 
-            if sys.platform == "win32":
-                if kill_after_timeout is not None:
-                    raise GitCommandError(
-                        redacted_command,
-                        '"kill_after_timeout" feature is not supported on Windows.',
-                    )
-                cmd_not_found_exception = OSError
-            else:
-                cmd_not_found_exception = FileNotFoundError
-            # END handle
-
-            stdout_sink = (
-                PIPE
-                if with_stdout
-                else getattr(subprocess, "DEVNULL", None) or open(os.devnull, "wb")
-            )
-            if shell is None:
-                # Get the value of USE_SHELL with no deprecation warning. Do this without
-                # warnings.catch_warnings, to avoid a race condition with application code
-                # configuring warnings. The value could be looked up in type(self).__dict__
-                # or Git.__dict__, but those can break under some circumstances. This works
-                # the same as self.USE_SHELL in more situations; see Git.__getattribute__.
-                shell = super(Git, self).__getattribute__("USE_SHELL")
-            _logger.debug(
-                "Popen(%s, cwd=%s, stdin=%s, shell=%s, universal_newlines=%s)",
-                redacted_command,
-                cwd,
-                "<valid stream>" if istream else "None",
-                shell,
-                universal_newlines,
-            )
-
-            git_command_id = -1
-            if as_process and anchorpoint:
-                git_command_id = anchorpoint.queue_git_command(
-                    plain_git_command, git_args
-                )
-            try:
-                proc = safer_popen(
-                    command,
-                    env=env,
-                    cwd=cwd,
-                    bufsize=-1,
-                    stdin=(istream or DEVNULL),
-                    stderr=PIPE,
-                    stdout=stdout_sink,
-                    shell=shell,
-                    universal_newlines=universal_newlines,
-                    encoding=defenc if universal_newlines else None,
-                    **subprocess_kwargs,
-                )
-            except cmd_not_found_exception as err:
-                if git_command_id != -1:
-                    anchorpoint.finish_git_command(git_command_id)
-                raise GitCommandNotFound(redacted_command, err) from err
-            else:
-                # Replace with a typeguard for Popen[bytes]?
-                proc.stdout = cast(BinaryIO, proc.stdout)
-                proc.stderr = cast(BinaryIO, proc.stderr)
-
-            if as_process:
-                return self.AutoInterrupt(proc, command, git_command_id)
-
-            if sys.platform != "win32" and kill_after_timeout is not None:
-                # Help mypy figure out this is not None even when used inside communicate().
-                timeout = kill_after_timeout
-
-                def kill_process(pid: int) -> None:
-                    """Callback to kill a process.
-
-                    This callback implementation would be ineffective and unsafe on Windows.
-                    """
-                    p = Popen(["ps", "--ppid", str(pid)], stdout=PIPE)
-                    child_pids = []
-                    if p.stdout is not None:
-                        for line in p.stdout:
-                            if len(line.split()) > 0:
-                                local_pid = (line.split())[0]
-                                if local_pid.isdigit():
-                                    child_pids.append(int(local_pid))
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                        for child_pid in child_pids:
-                            try:
-                                os.kill(child_pid, signal.SIGKILL)
-                            except OSError:
-                                pass
-                        # Tell the main routine that the process was killed.
-                        kill_check.set()
-                    except OSError:
-                        # It is possible that the process gets completed in the duration
-                        # after timeout happens and before we try to kill the process.
-                        pass
-                    return
-
-                def communicate() -> Tuple[AnyStr, AnyStr]:
-                    watchdog.start()
-                    out, err = proc.communicate()
-                    watchdog.cancel()
-                    if kill_check.is_set():
-                        err = (
-                            'Timeout: the command "%s" did not complete in %d '
-                            "secs."
-                            % (
-                                " ".join(redacted_command),
-                                timeout,
-                            )
-                        )
-                        if not universal_newlines:
-                            err = err.encode(defenc)
-                    return out, err
-
-                # END helpers
-
-                kill_check = threading.Event()
-                watchdog = threading.Timer(timeout, kill_process, args=(proc.pid,))
-            else:
-                communicate = proc.communicate
-
-            # Wait for the process to return.
-            status = 0
-            stdout_value: Union[str, bytes] = b""
-            stderr_value: Union[str, bytes] = b""
-            newline = "\n" if universal_newlines else b"\n"
-            try:
-                if output_stream is None:
-                    stdout_value, stderr_value = communicate()
-                    # Strip trailing "\n".
-                    if stdout_value.endswith(newline) and strip_newline_in_stdout:  # type: ignore[arg-type]
-                        stdout_value = stdout_value[:-1]
-                    if stderr_value.endswith(newline):  # type: ignore[arg-type]
-                        stderr_value = stderr_value[:-1]
-
-                    status = proc.returncode
-                else:
-                    max_chunk_size = (
-                        max_chunk_size
-                        if max_chunk_size and max_chunk_size > 0
-                        else io.DEFAULT_BUFFER_SIZE
-                    )
-                    stream_copy(proc.stdout, output_stream, max_chunk_size)
-                    stdout_value = proc.stdout.read()
-                    stderr_value = proc.stderr.read()
-                    # Strip trailing "\n".
-                    if stderr_value.endswith(newline):  # type: ignore[arg-type]
-                        stderr_value = stderr_value[:-1]
-                    status = proc.wait()
-                # END stdout handling
-            finally:
-                proc.stdout.close()
-                proc.stderr.close()
-
-            if self.GIT_PYTHON_TRACE == "full":
-                cmdstr = " ".join(redacted_command)
-
-                def as_text(stdout_value: Union[bytes, str]) -> str:
-                    return (
-                        not output_stream
-                        and safe_decode(stdout_value)
-                        or "<OUTPUT_STREAM>"
-                    )
-
-                # END as_text
-
-                if stderr_value:
-                    _logger.info(
-                        "%s -> %d; stdout: '%s'; stderr: '%s'",
-                        cmdstr,
-                        status,
-                        as_text(stdout_value),
-                        safe_decode(stderr_value),
-                    )
-                elif stdout_value:
-                    _logger.info(
-                        "%s -> %d; stdout: '%s'", cmdstr, status, as_text(stdout_value)
-                    )
-                else:
-                    _logger.info("%s -> %d", cmdstr, status)
-            # END handle debug printing
-
-            if with_exceptions and status != 0:
+        if sys.platform == "win32":
+            if kill_after_timeout is not None:
                 raise GitCommandError(
-                    redacted_command, status, stderr_value, stdout_value
+                    redacted_command,
+                    '"kill_after_timeout" feature is not supported on Windows.',
+                )
+            cmd_not_found_exception = OSError
+        else:
+            cmd_not_found_exception = FileNotFoundError
+        # END handle
+
+        stdout_sink = (
+            PIPE
+            if with_stdout
+            else getattr(subprocess, "DEVNULL", None) or open(os.devnull, "wb")
+        )
+        if shell is None:
+            # Get the value of USE_SHELL with no deprecation warning. Do this without
+            # warnings.catch_warnings, to avoid a race condition with application code
+            # configuring warnings. The value could be looked up in type(self).__dict__
+            # or Git.__dict__, but those can break under some circumstances. This works
+            # the same as self.USE_SHELL in more situations; see Git.__getattribute__.
+            shell = super().__getattribute__("USE_SHELL")
+        _logger.debug(
+            "Popen(%s, cwd=%s, stdin=%s, shell=%s, universal_newlines=%s)",
+            redacted_command,
+            cwd,
+            "<valid stream>" if istream else "None",
+            shell,
+            universal_newlines,
+        )
+
+        git_command_id = -1
+        if anchorpoint:
+            git_command_id = anchorpoint.queue_git_command(plain_git_command, git_args)
+        try:
+            proc = safer_popen(
+                command,
+                env=env,
+                cwd=cwd,
+                bufsize=-1,
+                stdin=(istream or DEVNULL),
+                stderr=PIPE,
+                stdout=stdout_sink,
+                shell=shell,
+                universal_newlines=universal_newlines,
+                encoding=defenc if universal_newlines else None,
+                **subprocess_kwargs,
+            )
+        except cmd_not_found_exception as err:
+            if anchorpoint:
+                anchorpoint.finish_git_command(git_command_id)
+            raise GitCommandNotFound(redacted_command, err) from err
+        except:
+            if anchorpoint:
+                anchorpoint.finish_git_command(git_command_id)
+            raise
+        else:
+            # Replace with a typeguard for Popen[bytes]?
+            proc.stdout = cast(BinaryIO, proc.stdout)
+            proc.stderr = cast(BinaryIO, proc.stderr)
+
+        if as_process:
+            return self.AutoInterrupt(proc, command, git_command_id)
+
+        if sys.platform != "win32" and kill_after_timeout is not None:
+            # Help mypy figure out this is not None even when used inside communicate().
+            timeout = kill_after_timeout
+
+            def kill_process(pid: int) -> None:
+                """Callback to kill a process.
+
+                This callback implementation would be ineffective and unsafe on Windows.
+                """
+                p = Popen(["ps", "--ppid", str(pid)], stdout=PIPE)
+                child_pids = []
+                if p.stdout is not None:
+                    for line in p.stdout:
+                        if len(line.split()) > 0:
+                            local_pid = (line.split())[0]
+                            if local_pid.isdigit():
+                                child_pids.append(int(local_pid))
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    for child_pid in child_pids:
+                        try:
+                            os.kill(child_pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+                    # Tell the main routine that the process was killed.
+                    kill_check.set()
+                except OSError:
+                    # It is possible that the process gets completed in the duration
+                    # after timeout happens and before we try to kill the process.
+                    pass
+                return
+
+            def communicate() -> Tuple[AnyStr, AnyStr]:
+                watchdog.start()
+                out, err = proc.communicate()
+                watchdog.cancel()
+                if kill_check.is_set():
+                    err = 'Timeout: the command "%s" did not complete in %d secs.' % (
+                        " ".join(redacted_command),
+                        timeout,
+                    )
+                    if not universal_newlines:
+                        err = err.encode(defenc)
+                return out, err
+
+            # END helpers
+
+            kill_check = threading.Event()
+            watchdog = threading.Timer(timeout, kill_process, args=(proc.pid,))
+        else:
+            communicate = proc.communicate
+
+        # Wait for the process to return.
+        status = 0
+        stdout_value: Union[str, bytes] = b""
+        stderr_value: Union[str, bytes] = b""
+        newline = "\n" if universal_newlines else b"\n"
+        try:
+            if output_stream is None:
+                stdout_value, stderr_value = communicate()
+                # Strip trailing "\n".
+                if stdout_value.endswith(newline) and strip_newline_in_stdout:  # type: ignore[arg-type]
+                    stdout_value = stdout_value[:-1]
+                if stderr_value.endswith(newline):  # type: ignore[arg-type]
+                    stderr_value = stderr_value[:-1]
+
+                status = proc.returncode
+            else:
+                max_chunk_size = (
+                    max_chunk_size
+                    if max_chunk_size and max_chunk_size > 0
+                    else io.DEFAULT_BUFFER_SIZE
+                )
+                stream_copy(proc.stdout, output_stream, max_chunk_size)
+                stdout_value = proc.stdout.read()
+                stderr_value = proc.stderr.read()
+                # Strip trailing "\n".
+                if stderr_value.endswith(newline):  # type: ignore[arg-type]
+                    stderr_value = stderr_value[:-1]
+                status = proc.wait()
+            # END stdout handling
+        finally:
+            proc.stdout.close()
+            proc.stderr.close()
+            if anchorpoint:
+                anchorpoint.finish_git_command(git_command_id)
+
+        if self.GIT_PYTHON_TRACE == "full":
+            cmdstr = " ".join(redacted_command)
+
+            def as_text(stdout_value: Union[bytes, str]) -> str:
+                return (
+                    not output_stream and safe_decode(stdout_value) or "<OUTPUT_STREAM>"
                 )
 
-            if (
-                isinstance(stdout_value, bytes) and stdout_as_string
-            ):  # Could also be output_stream.
-                stdout_value = safe_decode(stdout_value)
+            # END as_text
 
-            # Allow access to the command's status code.
-            if with_extended_output:
-                return (status, stdout_value, safe_decode(stderr_value))
+            if stderr_value:
+                _logger.info(
+                    "%s -> %d; stdout: '%s'; stderr: '%s'",
+                    cmdstr,
+                    status,
+                    as_text(stdout_value),
+                    safe_decode(stderr_value),
+                )
+            elif stdout_value:
+                _logger.info(
+                    "%s -> %d; stdout: '%s'", cmdstr, status, as_text(stdout_value)
+                )
             else:
-                return stdout_value
+                _logger.info("%s -> %d", cmdstr, status)
+        # END handle debug printing
 
-        if anchorpoint is not None and not as_process:
-            with anchorpoint.QueueGitCommand(plain_git_command, git_args):
-                try:
-                    return _execute()
-                except Exception as e:
-                    raise e
+        if with_exceptions and status != 0:
+            raise GitCommandError(redacted_command, status, stderr_value, stdout_value)
+
+        if (
+            isinstance(stdout_value, bytes) and stdout_as_string
+        ):  # Could also be output_stream.
+            stdout_value = safe_decode(stdout_value)
+
+        # Allow access to the command's status code.
+        if with_extended_output:
+            return (status, stdout_value, safe_decode(stderr_value))
         else:
-            return _execute()
+            return stdout_value
 
     def environment(self) -> Dict[str, str]:
         return self._environment
